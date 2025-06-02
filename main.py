@@ -1,5 +1,6 @@
 import discord
 from discord.ext import tasks, commands
+from discord.ui import View, Select
 from datetime import datetime, timedelta
 import asyncio
 import os
@@ -8,25 +9,23 @@ from routine_data import combined_routine, subject_map, type_map
 
 # Load environment variables
 load_dotenv()
-
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-
 GROUP_C_ROLE_ID = int(os.getenv("GROUP_C_ROLE_ID"))
 GROUP_D_ROLE_ID = int(os.getenv("GROUP_D_ROLE_ID"))
 CLASS_ROLE_ID = int(os.getenv("CLASS_ROLE_ID"))
-
-print("🔑 TOKEN loaded:", TOKEN[:10] + "..." if TOKEN else "❌ Not found")
-print("📢 CHANNEL_ID loaded:", CHANNEL_ID)
-print("👥 Role IDs loaded:", GROUP_C_ROLE_ID, GROUP_D_ROLE_ID, CLASS_ROLE_ID)
+CR_ROLE_ID = int(os.getenv("CR_ROLE_ID"))
 
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-# To keep track of sent notifications to avoid repeats
 notified_classes = set()
+cancelled_classes = set()
+
+
+def parse_time_range(time_range):
+    return datetime.strptime(time_range.split(" - ")[0], "%H:%M").time()
+
 
 @bot.event
 async def on_ready():
@@ -34,13 +33,158 @@ async def on_ready():
     await asyncio.sleep(1)
     check_schedule.start()
 
-def parse_time_range(time_range: str) -> datetime.time:
-    start_time = time_range.split(" - ")[0]
-    return datetime.strptime(start_time, "%H:%M").time()
 
 @bot.command()
 async def test(ctx):
     await ctx.send("✅ Bot is working!")
+
+
+class CancelClassView(View):
+    def __init__(self, classes_today):
+        super().__init__(timeout=60)
+        self.add_item(CancelClassSelect(classes_today))
+
+
+class CancelClassSelect(Select):
+    def __init__(self, classes_today):
+        options = []
+        for c in classes_today:
+            time = c['time']
+            if isinstance(c['subject'], dict):
+                for group in ('C', 'D'):
+                    subject = c['subject'][group]
+                    type_ = type_map.get(c['type'][group])
+                    subject_name = subject_map.get(subject, subject)
+                    label = f"{type_}: {subject_name} ({group}) at {time}"
+                    value = f"{group}|{time}"
+                    options.append(discord.SelectOption(label=label, value=value))
+            else:
+                subject = c['subject']
+                type_ = type_map.get(c.get('type'))
+                subject_name = subject_map.get(subject, subject)
+                label = f"{type_}: {subject_name} at {time}"
+                value = f"BOTH|{time}"
+                options.append(discord.SelectOption(label=label, value=value))
+
+        super().__init__(placeholder="Select a class to cancel...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        group, time = value.split("|")
+        today = datetime.now().strftime("%A")
+        cancelled_classes.add((today, time, group))
+
+        if group == "BOTH":
+            role_ping = f"<@&{CLASS_ROLE_ID}>"
+            routine_entry = next(e for e in combined_routine[today] if e['time'] == time)
+            subject = routine_entry['subject']
+            type_ = type_map.get(routine_entry.get('type'))
+            subject_name = subject_map.get(subject, subject)
+        else:
+            role_ping = f"<@&{GROUP_C_ROLE_ID}>" if group == "C" else f"<@&{GROUP_D_ROLE_ID}>"
+            routine_entry = next(e for e in combined_routine[today] if e['time'] == time)
+            subject = routine_entry['subject'][group]
+            type_ = type_map.get(routine_entry['type'][group])
+            subject_name = subject_map.get(subject, subject)
+
+        await interaction.response.send_message(
+            f"🚫 {role_ping} **{type_} canceled!**\n📚 {subject_name} at {time} will not be held today.",
+            allowed_mentions=discord.AllowedMentions(roles=True)
+        )
+
+
+@bot.command()
+async def cancelclass(ctx):
+    if CR_ROLE_ID not in [role.id for role in ctx.author.roles]:
+        await ctx.send("🚫 You are not authorized to cancel classes.")
+        return
+
+    today = datetime.now().strftime("%A")
+    classes_today = [entry for entry in combined_routine.get(today, []) if "BREAK" not in str(entry['subject'])]
+
+    if not classes_today:
+        await ctx.send("No classes scheduled today.")
+        return
+
+    await ctx.send("Select the class to cancel:", view=CancelClassView(classes_today))
+
+
+@bot.command()
+async def classes(ctx):
+    now = datetime.now()
+    today = now.strftime("%A")
+    user_roles = [role.id for role in ctx.author.roles]
+
+    # Determine user's group
+    if GROUP_C_ROLE_ID in user_roles:
+        user_group = "C"
+    elif GROUP_D_ROLE_ID in user_roles:
+        user_group = "D"
+    else:
+        user_group = "BOTH"  # No specific group, show combined
+
+    schedule = combined_routine.get(today, [])
+    remaining_classes = []
+
+    for entry in schedule:
+        entry_start_time = parse_time_range(entry['time'])
+        class_datetime = datetime.combine(now.date(), entry_start_time)
+
+        if class_datetime < now:
+            # Skip classes that already started
+            continue
+
+        # Skip breaks
+        if isinstance(entry['subject'], dict):
+            # Check if all are BREAKs, skip entirely
+            if all(subj == "BREAK" for subj in entry['subject'].values()):
+                continue
+        else:
+            if entry['subject'] == "BREAK":
+                continue
+
+        if user_group == "BOTH":
+            # Show all classes
+            if isinstance(entry['subject'], dict):
+                for group in ('C', 'D'):
+                    subject = entry['subject'][group]
+                    if subject == "BREAK":
+                        continue
+                    type_ = type_map.get(entry['type'].get(group), "Lecture")
+                    subject_name = subject_map.get(subject, subject)
+                    remaining_classes.append(f"({group}) {type_}: {subject_name} at {entry['time']}")
+            else:
+                subject = entry['subject']
+                type_ = type_map.get(entry.get('type'), "Lecture")
+                subject_name = subject_map.get(subject, subject)
+                remaining_classes.append(f"{type_}: {subject_name} at {entry['time']}")
+        else:
+            # Show only user's group classes
+            if isinstance(entry['subject'], dict):
+                subject = entry['subject'].get(user_group)
+                if not subject or subject == "BREAK":
+                    continue
+                type_ = type_map.get(entry['type'].get(user_group), "Lecture")
+                subject_name = subject_map.get(subject, subject)
+                remaining_classes.append(f"{type_}: {subject_name} at {entry['time']}")
+            else:
+                # Single subject for all groups
+                subject = entry['subject']
+                if subject == "BREAK":
+                    continue
+                type_ = type_map.get(entry.get('type'), "Lecture")
+                subject_name = subject_map.get(subject, subject)
+                remaining_classes.append(f"{type_}: {subject_name} at {entry['time']}")
+
+    if not remaining_classes:
+        await ctx.send("✅ No remaining classes for today!")
+        return
+
+    # Send a nicely formatted message
+    title = f"📅 Remaining classes for {'Group ' + user_group if user_group != 'BOTH' else 'All Groups'} today:"
+    message = "\n".join(remaining_classes)
+    await ctx.send(f"{title}\n{message}")
+
 
 @tasks.loop(minutes=1)
 async def check_schedule():
@@ -48,76 +192,39 @@ async def check_schedule():
     try:
         now = datetime.now()
         today = now.strftime("%A")
-
-        # Clean old notifications for previous days
         notified_classes = {entry for entry in notified_classes if entry[0] == today}
 
         for entry in combined_routine.get(today, []):
-            entry_start_time = parse_time_range(entry["time"])
+            entry_start_time = parse_time_range(entry['time'])
             class_datetime = datetime.combine(now.date(), entry_start_time)
-            #reminder_datetime = class_datetime - timedelta(minutes=15)
-            reminder_datetime = now
+            reminder_datetime = class_datetime - timedelta(minutes=15)
 
-            # Notify if current time is within ±60 seconds of reminder time
             if abs((now - reminder_datetime).total_seconds()) <= 60:
-                notification_key = (today, entry["time"])
-
-                if notification_key in notified_classes:
-                    continue  # Already notified
-
-                # Determine subjects and types for both groups
-                if isinstance(entry["subject"], dict):
-                    subj_c = entry["subject"].get("C")
-                    subj_d = entry["subject"].get("D")
-                    type_c = type_map.get(entry["type"].get("C"))
-                    type_d = type_map.get(entry["type"].get("D"))
+                if isinstance(entry['subject'], dict):
+                    for group in ('C', 'D'):
+                        subject = entry['subject'][group]
+                        type_ = type_map.get(entry['type'][group])
+                        subject_name = subject_map.get(subject, subject)
+                        notification_key = (today, entry['time'], group)
+                        if notification_key in notified_classes or notification_key in cancelled_classes:
+                            continue
+                        role = f"<@&{GROUP_C_ROLE_ID}>" if group == "C" else f"<@&{GROUP_D_ROLE_ID}>"
+                        msg = f"{role} ⏰ **Upcoming {type_} in 15 minutes!**\n📚 {subject_name} at {entry['time']}"
+                        await bot.get_channel(CHANNEL_ID).send(msg)
+                        notified_classes.add(notification_key)
                 else:
-                    subj_c = subj_d = entry["subject"]
-                    type_c = type_d = type_map.get(entry.get("type"))
-
-                # Skip if both groups have BREAK
-                if subj_c == "BREAK" and subj_d == "BREAK":
-                    continue
-
-                channel = bot.get_channel(CHANNEL_ID)
-                if not channel:
-                    print("❌ Failed to fetch channel.")
-                    return
-
-                # Compose and send notifications
-                if subj_c == subj_d:
-                    # Same subject and type for both groups (and not BREAK)
-                    if subj_c != "BREAK":
-                        subject_name = subject_map.get(subj_c, subj_c)
-                        msg = (
-                            f"<@&{CLASS_ROLE_ID}> ⏰ **Upcoming {type_c} in 15 minutes!**\n"
-                            f"📚 {subject_name} at {entry['time']}"
-                        )
-                        await channel.send(msg)
-                        print(f"✅ Sent combined notification for both groups: {subject_name} at {entry['time']}")
-                else:
-                    # Different classes for groups
-                    if subj_c != "BREAK":
-                        subject_name_c = subject_map.get(subj_c, subj_c)
-                        msg_c = (
-                            f"<@&{GROUP_C_ROLE_ID}> ⏰ **Upcoming {type_c} in 15 minutes!**\n"
-                            f"📚 {subject_name_c} at {entry['time']}"
-                        )
-                        await channel.send(msg_c)
-                        print(f"✅ Sent notification for Group C: {subject_name_c} at {entry['time']}")
-
-                    if subj_d != "BREAK":
-                        subject_name_d = subject_map.get(subj_d, subj_d)
-                        msg_d = (
-                            f"<@&{GROUP_D_ROLE_ID}> ⏰ **Upcoming {type_d} in 15 minutes!**\n"
-                            f"📚 {subject_name_d} at {entry['time']}"
-                        )
-                        await channel.send(msg_d)
-                        print(f"✅ Sent notification for Group D: {subject_name_d} at {entry['time']}")
-
-                notified_classes.add(notification_key)
+                    subject = entry['subject']
+                    type_ = type_map.get(entry.get('type'))
+                    subject_name = subject_map.get(subject, subject)
+                    notification_key = (today, entry['time'], "BOTH")
+                    if notification_key in notified_classes or notification_key in cancelled_classes:
+                        continue
+                    msg = f"<@&{CLASS_ROLE_ID}> ⏰ **Upcoming {type_} in 15 minutes!**\n📚 {subject_name} at {entry['time']}"
+                    await bot.get_channel(CHANNEL_ID).send(msg)
+                    notified_classes.add(notification_key)
 
     except Exception as e:
         print(f"❌ Error in check_schedule: {e}")
+
 
 bot.run(TOKEN)
