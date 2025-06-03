@@ -47,7 +47,19 @@ combined_routine = {
                 "D": "p"
             }
         },
-        {"time": "13:35 - 15:15", "subject": "DL", "type": "l"}
+        {"time": "13:35 - 15:15", "subject": "DL", "type": "l"},
+        {"time": "15:15 - 16:15", "subject": "Chemistry", "type": "l"},
+        {
+            "time": "16:16 - 17:15",
+            "subject": {
+                "C": "OOP",
+                "D": "EDC"
+            },
+            "type": {
+                "C": "p",
+                "D": "p"
+            }
+        }
     ],
     "Wednesday": [
         {"time": "7:45 - 8:35", "subject": "M", "type": "l"},
